@@ -46,6 +46,44 @@ def clean_llm_text(x) -> str:
     return s.strip()
 
 
+# =========================
+# JSON SAFE PARSING (LLM OUTPUT)  ✅ (INTEGRADO SIN CAMBIAR LO FUNCIONAL)
+# =========================
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+def _extract_json_object(text: str) -> str:
+    if not text:
+        return ""
+    m = _JSON_OBJ_RE.search(text)
+    return m.group(0).strip() if m else text.strip()
+
+def _repair_common_json_issues(s: str) -> str:
+    if not s:
+        return s
+
+    # Quita fences si el modelo se las “olvida”
+    s = s.replace("```json", "").replace("```", "").strip()
+
+    # Reemplaza comillas tipográficas
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+
+    # Elimina trailing commas antes de } o ]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # Limpia caracteres de control
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
+
+    return s.strip()
+
+def parse_llm_json(txt: str) -> dict:
+    raw = _extract_json_object(txt)
+    try:
+        return json.loads(raw)
+    except Exception:
+        fixed = _repair_common_json_issues(raw)
+        return json.loads(fixed)
+
+
 st.set_page_config(
     page_title="ABRAXA MARKET INTELLIGENCE",
     layout="wide",
@@ -288,25 +326,42 @@ PAYLOAD:
 {json.dumps(payload, ensure_ascii=False)}
 """
 
-    try:
+    def _call(prompt_user: str) -> str:
         resp = client.chat.completions.create(
             model=model,
             temperature=0.15,
             max_tokens=700,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": prompt_user},
             ],
         )
-        txt = (resp.choices[0].message.content or "").strip()
+        return (resp.choices[0].message.content or "").strip()
 
-        # extrae JSON si viene con texto adicional
-        start = txt.find("{")
-        end = txt.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            txt = txt[start:end+1]
+    try:
+        txt = _call(user)
 
-        return json.loads(txt)
+        # 1) Parse robusto (extrae + repara comas/comillas)
+        try:
+            return parse_llm_json(txt)
+        except Exception:
+            # 2) Self-heal: pide al modelo arreglar SU salida a JSON válido
+            fixer = f"""
+Convierte esto en JSON VÁLIDO. Devuelve SOLO JSON. No agregues texto.
+TEXTO:
+{txt}
+"""
+            txt2 = _call(fixer)
+            try:
+                return parse_llm_json(txt2)
+            except Exception as e2:
+                return {
+                    "headline": "AI Interpretation failed.",
+                    "drivers": [],
+                    "risks": [{"bullet": "Error al generar interpretación", "why": str(e2), "metrics": []}],
+                    "invalidation": [],
+                    "tl_dr": ""
+                }
 
     except Exception as e:
         return {
@@ -1075,6 +1130,80 @@ def _snapshot_label(s: Dict) -> str:
         core = "(sin fechas)"
     return f"{core}   [{src}]   —   {sid}"
 
+# =========================
+# 6.9) AI CACHE (PRECOMPUTE / ONE-TIME)
+# =========================
+AI_CACHE_DIR = os.path.join(SNAP_DIR, "ai_cache")
+MODEL_VERSION = "v1"  # súbelo a v2/v3 cuando cambies prompt o lógica
+
+def _ensure_ai_cache_dir():
+    os.makedirs(AI_CACHE_DIR, exist_ok=True)
+
+def _safe_key(s: str) -> str:
+    s = str(s or "").strip()
+    s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
+    return s[:180] if len(s) > 180 else s
+
+def _payload_fingerprint(payload: dict) -> str:
+    try:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        raw = str(payload)
+    import hashlib
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def _ai_cache_path(pair: str, cache_key: str) -> str:
+    _ensure_ai_cache_dir()
+    pdir = os.path.join(AI_CACHE_DIR, _safe_key(pair))
+    os.makedirs(pdir, exist_ok=True)
+    return os.path.join(pdir, f"{_safe_key(cache_key)}.json")
+
+def load_ai_cache(pair: str, cache_key: str) -> Optional[dict]:
+    try:
+        path = _ai_cache_path(pair, cache_key)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_ai_cache(pair: str, cache_key: str, data: dict):
+    try:
+        path = _ai_cache_path(pair, cache_key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def build_ai_cache_key(pair: str, view_mode: str, snapshot_id: Optional[str], payload: dict) -> str:
+    fp = _payload_fingerprint(payload)
+    sid = snapshot_id or "LIVE"
+    return f"{MODEL_VERSION}__{view_mode}__{sid}__{pair}__{fp}"
+
+def get_or_build_ai_interpretation(pair: str, view_mode: str, snapshot_id: Optional[str], payload: dict) -> dict:
+    ck = build_ai_cache_key(pair, view_mode, snapshot_id, payload)
+    cached = load_ai_cache(pair, ck)
+    if cached is not None:
+        cached["_cache"] = {"hit": True, "key": ck}
+        return cached
+
+    llm = llama_interpret_bias(payload)
+    llm["_cache"] = {"hit": False, "key": ck, "saved_utc": datetime.utcnow().isoformat()}
+    save_ai_cache(pair, ck, llm)
+    return llm
+
+def clear_pair_ai_cache(pair: str):
+    try:
+        pdir = os.path.join(AI_CACHE_DIR, _safe_key(pair))
+        if os.path.isdir(pdir):
+            for fn in os.listdir(pdir):
+                try:
+                    os.remove(os.path.join(pdir, fn))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 # =========================
 # 7) DETALLES POR PAR
@@ -1129,50 +1258,43 @@ def render_pair_details(pair_name, df_full):
 
     st.markdown(f"## {pair_name} // INSTITUTIONAL DEEP ANALYSIS")
 
-    # 1) Chart (YFinance FIXED + CACHED)
+        # 1) Chart (LINE by default + cached)
     try:
         hist = get_price_history_cached(pair_name)
 
         if hist is None or hist.empty:
             st.warning("No pude cargar la gráfica (YFinance). Probablemente rate-limit o símbolo sin data.")
         else:
-            # Normaliza OHLC
-            # yfinance retorna columnas con mayúsculas: Open/High/Low/Close
-            for col in ["Open", "High", "Low", "Close"]:
-                if col not in hist.columns:
-                    # intenta con lower
-                    lc = col.lower()
-                    if lc in hist.columns:
-                        hist[col] = hist[lc]
+            if "Close" not in hist.columns and "close" in hist.columns:
+                hist["Close"] = hist["close"]
 
-            fig = go.Figure(data=[go.Candlestick(
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
                 x=hist.index,
-                open=hist["Open"],
-                high=hist["High"],
-                low=hist["Low"],
-                close=hist["Close"],
-                increasing_line_color="#089981",
-                decreasing_line_color="#f23645"
-            )])
+                y=hist["Close"],
+                mode="lines",
+                name="Close"
+            ))
 
             fig.update_layout(
                 template="plotly_dark",
                 paper_bgcolor="black",
                 plot_bgcolor="black",
                 height=520,
-                xaxis_rangeslider_visible=False,
-                margin=dict(l=0, r=0, t=10, b=0)
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor="#14161b"),
+                showlegend=False
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Botón manual para refrescar SOLO la gráfica (sin romper todo)
-            c_ref1, c_ref2 = st.columns([1, 5])
+            c_ref1, c_ref2 = st.columns([1.2, 4])
             with c_ref1:
                 if st.button("↻ Refresh chart", use_container_width=True):
                     get_price_history_cached.clear()
                     st.rerun()
             with c_ref2:
-                st.caption("Gráfica cacheada 1h para que salga fija (evita fallos por refresh).")
+                st.caption("Gráfica LINE (Close) cacheada 1h para que sea estable (no se rompe con autorefresh).")
 
     except Exception as e:
         st.error(f"Error cargando gráfica de {pair_name}: {e}")
@@ -1302,7 +1424,12 @@ def render_pair_details(pair_name, df_full):
         }
 
         with st.spinner("Interpretando drivers macro..."):
-            llm = llama_interpret_bias(payload)
+            llm = get_or_build_ai_interpretation(
+                pair=pair_name,
+                view_mode=st.session_state.get("view_mode", "LIVE"),
+                snapshot_id=st.session_state.get("snapshot_id", None),
+                payload=payload
+            )
 
         headline = clean_llm_text(llm.get("headline", ""))
         tldr = clean_llm_text(llm.get("tl_dr", ""))
