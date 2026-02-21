@@ -1,0 +1,5 @@
+{
+  "sefonmar": { "password": "1", "role": "admin" },
+  "invitado_demo": { "password": "abraxa_2026", "role": "demo" },
+  "vip": { "password": "vip", "role": "vip" }
+}
